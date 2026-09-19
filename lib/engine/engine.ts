@@ -12,17 +12,24 @@
 //  - Undo = drop the last player action and replay (single source of truth = action log).
 
 export type PlayerId = string;
-export type ActionType = "BOOT" | "BLIND" | "SEEN" | "FOLD" | "SHOW";
+export type ActionType = "BOOT" | "BLIND" | "SEEN" | "FOLD" | "SHOW" | "SIDE_SHOW";
 export type PlayerStatus = "ACTIVE" | "FOLDED" | "WINNER";
 export type Phase = "BETTING" | "AWAITING_WINNER" | "COMPLETE";
-export type PlayInput = "BLIND" | "SEEN" | "FOLD" | "SHOW";
+export type PlayInput = "BLIND" | "SEEN" | "FOLD" | "SHOW" | "SIDE_SHOW";
+
+// Resolution of a requested side-show, entered by the recorder (the app can't
+// see the cards). The requester always pays the request cost regardless.
+export type SideShowOutcome =
+  | "DECLINE" // target refuses; both stay in, play continues
+  | "TARGET_FOLDS" // compared, target had the weaker hand
+  | "REQUESTER_FOLDS"; // compared, requester had the weaker hand
 
 export interface Rules {
   bootAmount: number; // minor units, per player, paid at round start
   blindMultiplier: number;
   seenMultiplier: number;
   maxBet: number; // inert in MVP (no raise can trigger it); kept for variants
-  sideshowEnabled: boolean; // config only in MVP; no behavior
+  sideshowEnabled: boolean; // a seen player may request a side-show vs the previous seen player
   showEnabled: boolean;
 }
 
@@ -40,6 +47,8 @@ export interface RoundAction {
   type: ActionType;
   amount: number; // money added to pot by this action
   resultingChaal: number;
+  targetId?: PlayerId; // side-show only: the player asked to compare
+  outcome?: SideShowOutcome; // side-show only
 }
 
 export interface RoundState {
@@ -56,6 +65,7 @@ export interface RoundState {
 export interface PlayLog {
   playerId: PlayerId;
   type: PlayInput;
+  outcome?: SideShowOutcome; // side-show only (the target is recomputed on replay)
 }
 
 export interface PlayerSeat {
@@ -83,6 +93,11 @@ export function showAmount(chaal: number, rules: Rules): number {
   return seenAmount(chaal, rules);
 }
 
+// Requesting a side-show costs a seen bet (the requester is seen). Pluggable.
+export function sideShowAmount(chaal: number, rules: Rules): number {
+  return seenAmount(chaal, rules);
+}
+
 // MVP: chaal never changes mid-round. Variants (raises) replace this.
 // ponytail: constant chaal, swap this fn when raise support lands.
 export function nextChaal(chaal: number, _action: ActionType): number {
@@ -104,6 +119,31 @@ export function canShow(state: RoundState, rules: Rules): boolean {
   return rules.showEnabled && activePlayers(state).length === 2;
 }
 
+// The player a side-show would be requested against: the immediately preceding
+// active player, but only if they have seen their cards (you can't side-show a
+// blind player). null if not eligible.
+export function sideShowTarget(state: RoundState): PlayerId | null {
+  const cur = currentPlayer(state);
+  if (!cur) return null;
+  const prevId = previousActiveId(state, cur.id);
+  if (!prevId) return null;
+  const prev = state.players.find((p) => p.id === prevId)!;
+  return prev.hasSeen ? prevId : null;
+}
+
+// A seen player may request a side-show vs the previous seen player, only while
+// more than 2 players remain (with exactly 2, it's a SHOW).
+export function canSideShow(state: RoundState, rules: Rules): boolean {
+  const p = currentPlayer(state);
+  return (
+    rules.sideshowEnabled &&
+    !!p &&
+    p.hasSeen &&
+    activePlayers(state).length > 2 &&
+    sideShowTarget(state) !== null
+  );
+}
+
 // Options the UI should render for the current player.
 export function availableActions(state: RoundState, rules: Rules): PlayInput[] {
   const p = currentPlayer(state);
@@ -111,6 +151,7 @@ export function availableActions(state: RoundState, rules: Rules): PlayInput[] {
   const opts: PlayInput[] = [];
   if (!p.hasSeen) opts.push("BLIND");
   opts.push("SEEN");
+  if (canSideShow(state, rules)) opts.push("SIDE_SHOW");
   if (canShow(state, rules)) opts.push("SHOW");
   opts.push("FOLD");
   return opts;
@@ -158,8 +199,24 @@ function nextActiveId(state: RoundState, fromId: PlayerId): PlayerId | null {
   return null;
 }
 
+function previousActiveId(state: RoundState, fromId: PlayerId): PlayerId | null {
+  const n = state.players.length;
+  const start = state.players.findIndex((p) => p.id === fromId);
+  for (let step = 1; step <= n; step++) {
+    const p = state.players[(start - step + n) % n];
+    if (p.status === "ACTIVE") return p.id;
+  }
+  return null;
+}
+
 // Apply one player decision to the CURRENT player. Pure: returns a new state.
-export function applyPlay(state: RoundState, rules: Rules, type: PlayInput): RoundState {
+// `detail.outcome` is required for SIDE_SHOW (the recorder enters the result).
+export function applyPlay(
+  state: RoundState,
+  rules: Rules,
+  type: PlayInput,
+  detail?: { outcome?: SideShowOutcome },
+): RoundState {
   if (state.phase !== "BETTING") throw new Error(`Cannot play in phase ${state.phase}`);
   const player = currentPlayer(state);
   if (!player) throw new Error("No current player");
@@ -167,6 +224,8 @@ export function applyPlay(state: RoundState, rules: Rules, type: PlayInput): Rou
   if (type === "SHOW" && !canShow(state, rules)) {
     throw new Error("SHOW is only allowed with exactly 2 active players and show enabled");
   }
+
+  if (type === "SIDE_SHOW") return applySideShow(state, rules, player.id, detail?.outcome);
 
   let amount = 0;
   if (type === "BLIND") amount = blindAmount(state.chaal, rules);
@@ -210,6 +269,45 @@ export function applyPlay(state: RoundState, rules: Rules, type: PlayInput): Rou
   return { ...next, currentPlayerId: nextActiveId(next, player.id) };
 }
 
+// Side-show: the requester (current player) pays the request cost regardless of
+// outcome; on a compare the loser folds. Play then continues after the requester.
+function applySideShow(
+  state: RoundState,
+  rules: Rules,
+  requesterId: PlayerId,
+  outcome: SideShowOutcome | undefined,
+): RoundState {
+  if (!canSideShow(state, rules)) {
+    throw new Error("Side-show not allowed here (needs a seen requester, a seen previous player, and >2 active)");
+  }
+  if (!outcome) throw new Error("Side-show requires an outcome");
+  const targetId = sideShowTarget(state)!;
+  const amount = sideShowAmount(state.chaal, rules);
+  const folderId =
+    outcome === "TARGET_FOLDS" ? targetId : outcome === "REQUESTER_FOLDS" ? requesterId : null;
+
+  const players = state.players.map((p) => {
+    if (p.id === requesterId) return { ...p, contribution: p.contribution + amount };
+    return p;
+  }).map((p) => (p.id === folderId ? { ...p, status: "FOLDED" as PlayerStatus } : p));
+
+  const action: RoundAction = {
+    seq: state.actions.length,
+    playerId: requesterId,
+    type: "SIDE_SHOW",
+    amount,
+    resultingChaal: state.chaal, // side-show never changes the chaal
+    targetId,
+    outcome,
+  };
+
+  const next: RoundState = { ...state, players, pot: state.pot + amount, actions: [...state.actions, action] };
+  if (activePlayers(next).length <= 1) {
+    return { ...next, phase: "AWAITING_WINNER", currentPlayerId: null };
+  }
+  return { ...next, currentPlayerId: nextActiveId(next, requesterId) };
+}
+
 // Replay a full log from scratch (used by play() and undo() so there is one code path).
 export function buildState(seats: PlayerSeat[], rules: Rules, log: PlayLog[]): RoundState {
   let state = startRound(seats, rules);
@@ -217,7 +315,7 @@ export function buildState(seats: PlayerSeat[], rules: Rules, log: PlayLog[]): R
     if (state.currentPlayerId !== entry.playerId) {
       throw new Error(`Log out of order: expected ${state.currentPlayerId}, got ${entry.playerId}`);
     }
-    state = applyPlay(state, rules, entry.type);
+    state = applyPlay(state, rules, entry.type, { outcome: entry.outcome });
   }
   return state;
 }
@@ -226,7 +324,7 @@ export function buildState(seats: PlayerSeat[], rules: Rules, log: PlayLog[]): R
 export function playLog(state: RoundState): PlayLog[] {
   return state.actions
     .filter((a) => a.type !== "BOOT")
-    .map((a) => ({ playerId: a.playerId, type: a.type as PlayInput }));
+    .map((a) => ({ playerId: a.playerId, type: a.type as PlayInput, outcome: a.outcome }));
 }
 
 // Undo the last player decision. Boots are never undone; no-op safe when nothing to undo.

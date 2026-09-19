@@ -13,6 +13,8 @@ type ActionRow = {
   action_type: string;
   amount: number;
   sequence: number;
+  target_player_id: string | null;
+  resolution: string | null;
 };
 type RP = { player_id: string; status: string; contribution: number };
 
@@ -46,7 +48,7 @@ export default function RoundDetail({ params }: { params: Promise<{ id: string; 
       try {
         const [r, a, rp, g] = await Promise.all([
           supabase.from("rounds").select("round_number,pot_amount,game_id").eq("id", roundId).single(),
-          supabase.from("actions").select("player_id,action_type,amount,sequence").eq("round_id", roundId).order("sequence"),
+          supabase.from("actions").select("player_id,action_type,amount,sequence,target_player_id,resolution").eq("round_id", roundId).order("sequence"),
           supabase.from("round_players").select("player_id,status,contribution").eq("round_id", roundId),
           supabase.from("games").select("currency").eq("id", gameId).single(),
         ]);
@@ -95,8 +97,11 @@ export default function RoundDetail({ params }: { params: Promise<{ id: string; 
           <div key={a.sequence} className="flex justify-between text-neutral-300">
             <span>{nameById[a.player_id]}</span>
             <span>
-              {LABEL[a.action_type]}
-              {a.action_type !== "FOLD" && ` ${formatMoney(a.amount, currency)}`}
+              {a.action_type === "SIDE_SHOW"
+                ? `Side-show ${formatMoney(a.amount, currency)} vs ${nameById[a.target_player_id ?? ""] ?? "?"} · ${
+                    a.resolution === "TARGET_FOLDS" ? "won" : a.resolution === "REQUESTER_FOLDS" ? "lost" : "declined"
+                  }`
+                : `${LABEL[a.action_type]}${a.action_type !== "FOLD" ? ` ${formatMoney(a.amount, currency)}` : ""}`}
             </span>
           </div>
         ))}

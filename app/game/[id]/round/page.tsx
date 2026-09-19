@@ -19,11 +19,14 @@ import {
   blindAmount,
   seenAmount,
   showAmount,
+  sideShowAmount,
+  sideShowTarget,
   type Rules,
   type PlayerSeat,
   type RoundState,
   type PlayInput,
   type RoundAction,
+  type SideShowOutcome,
 } from "@/lib/engine/engine";
 
 type GameRow = { boot_amount: number; currency: string; name: string };
@@ -40,6 +43,7 @@ const ACTION_LABEL: Record<PlayInput, string> = {
   BLIND: "Blind",
   SEEN: "Seen",
   SHOW: "Show",
+  SIDE_SHOW: "Side-show",
   FOLD: "Fold",
 };
 
@@ -116,15 +120,19 @@ function RoundRecorderInner({ params }: { params: Promise<{ id: string }> }) {
             supabase.from("rounds").select("round_number").eq("id", editRoundId).single(),
             supabase
               .from("actions")
-              .select("player_id,action_type,sequence")
+              .select("player_id,action_type,sequence,resolution")
               .eq("round_id", editRoundId)
               .order("sequence"),
             supabase.from("round_players").select("player_id,status").eq("round_id", editRoundId),
           ]);
           if (rd.error) throw rd.error;
-          const log = ((ar.data as { player_id: string; action_type: string }[]) ?? [])
+          const log = ((ar.data as { player_id: string; action_type: string; resolution: string | null }[]) ?? [])
             .filter((a) => a.action_type !== "BOOT")
-            .map((a) => ({ playerId: a.player_id, type: a.action_type as PlayInput }));
+            .map((a) => ({
+              playerId: a.player_id,
+              type: a.action_type as PlayInput,
+              outcome: (a.resolution ?? undefined) as SideShowOutcome | undefined,
+            }));
           let st = buildState(seatList, engineRules, log);
           const winnerIds = ((wr.data as { player_id: string; status: string }[]) ?? [])
             .filter((x) => x.status === "WINNER")
@@ -142,9 +150,9 @@ function RoundRecorderInner({ params }: { params: Promise<{ id: string }> }) {
     })();
   }, [gameId, editRoundId]);
 
-  function play(type: PlayInput) {
+  function play(type: PlayInput, detail?: { outcome?: SideShowOutcome }) {
     if (!state || !rules) return;
-    setState(applyPlay(state, rules, type));
+    setState(applyPlay(state, rules, type, detail));
   }
   function doUndo() {
     if (!state || !rules) return;
@@ -180,6 +188,8 @@ function RoundRecorderInner({ params }: { params: Promise<{ id: string }> }) {
         amount: a.amount,
         resulting_chaal: a.resultingChaal,
         sequence: a.seq,
+        target_player_id: a.targetId ?? null,
+        resolution: a.outcome ?? null,
       })),
     });
     setSaving(false);
@@ -268,6 +278,11 @@ function RoundRecorderInner({ params }: { params: Promise<{ id: string }> }) {
 function actionSummary(a: RoundAction, currency: string): string {
   if (a.type === "FOLD") return "Fold";
   if (a.type === "BOOT") return `Boot ${formatMoney(a.amount, currency)}`;
+  if (a.type === "SIDE_SHOW") {
+    const r =
+      a.outcome === "TARGET_FOLDS" ? "won" : a.outcome === "REQUESTER_FOLDS" ? "lost" : "declined";
+    return `Side-show ${formatMoney(a.amount, currency)} · ${r}`;
+  }
   return `${ACTION_LABEL[a.type as PlayInput]} ${formatMoney(a.amount, currency)}`;
 }
 
@@ -287,7 +302,7 @@ function GuidedBetting({
   currency: string;
   nameById: Record<string, string>;
   gameId: string;
-  onPlay: (t: PlayInput) => void;
+  onPlay: (t: PlayInput, detail?: { outcome?: SideShowOutcome }) => void;
   onUndo: () => void;
 }) {
   const player = currentPlayer(state)!;
@@ -296,10 +311,16 @@ function GuidedBetting({
     BLIND: blindAmount(state.chaal, rules),
     SEEN: seenAmount(state.chaal, rules),
     SHOW: showAmount(state.chaal, rules),
+    SIDE_SHOW: sideShowAmount(state.chaal, rules),
     FOLD: 0,
   };
   const history = state.actions.filter((a) => a.type !== "BOOT").slice(-6).reverse();
   const canUndo = playLog(state).length > 0;
+
+  // Side-show is a two-tap interaction: request, then the recorder enters the result.
+  const [askSideShow, setAskSideShow] = useState(false);
+  const targetId = sideShowTarget(state);
+  const targetName = targetId ? nameById[targetId] : "";
 
   // Brief confirmation of the just-recorded action (fires only when the log grows,
   // so undo doesn't flash). Auto-clears after ~1.1s.
@@ -343,19 +364,60 @@ function GuidedBetting({
         <div className="mt-1 text-neutral-400">What does {player.name} play?</div>
       </div>
 
-      <div className="mt-6 grid gap-3">
-        {options.map((opt) => (
+      {askSideShow ? (
+        <div className="mt-6 space-y-3">
+          <div className="text-center text-neutral-400">
+            Side-show: <span className="text-neutral-100">{player.name}</span> vs{" "}
+            <span className="text-neutral-100">{targetName}</span>
+            <div className="text-xs text-neutral-600">Cost {formatMoney(amount.SIDE_SHOW, currency)} · result?</div>
+          </div>
           <Button
-            key={opt}
-            variant={opt === "FOLD" ? "ghost" : "primary"}
-            className="flex w-full items-center justify-between !text-2xl"
-            onClick={() => onPlay(opt)}
+            className="w-full !text-xl"
+            onClick={() => {
+              onPlay("SIDE_SHOW", { outcome: "TARGET_FOLDS" });
+              setAskSideShow(false);
+            }}
           >
-            <span>{ACTION_LABEL[opt]}</span>
-            {opt !== "FOLD" && <span>{formatMoney(amount[opt], currency)}</span>}
+            {targetName} folds
           </Button>
-        ))}
-      </div>
+          <Button
+            className="w-full !text-xl"
+            onClick={() => {
+              onPlay("SIDE_SHOW", { outcome: "REQUESTER_FOLDS" });
+              setAskSideShow(false);
+            }}
+          >
+            {player.name} folds
+          </Button>
+          <Button
+            variant="ghost"
+            className="w-full !text-xl"
+            onClick={() => {
+              onPlay("SIDE_SHOW", { outcome: "DECLINE" });
+              setAskSideShow(false);
+            }}
+          >
+            Declined
+          </Button>
+          <Button variant="ghost" className="w-full !min-h-12 !text-base" onClick={() => setAskSideShow(false)}>
+            Cancel
+          </Button>
+        </div>
+      ) : (
+        <div className="mt-6 grid gap-3">
+          {options.map((opt) => (
+            <Button
+              key={opt}
+              variant={opt === "FOLD" ? "ghost" : "primary"}
+              className="flex w-full items-center justify-between !text-2xl"
+              onClick={() => (opt === "SIDE_SHOW" ? setAskSideShow(true) : onPlay(opt))}
+            >
+              <span>{ACTION_LABEL[opt]}</span>
+              {opt !== "FOLD" && <span>{formatMoney(amount[opt], currency)}</span>}
+            </Button>
+          ))}
+        </div>
+      )}
 
       <div className="mt-6 flex items-center justify-between">
         <div className="text-lg">

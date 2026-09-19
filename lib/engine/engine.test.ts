@@ -17,6 +17,8 @@ import {
   availableActions,
   activePlayers,
   currentPlayer,
+  canSideShow,
+  sideShowTarget,
   type Rules,
   type PlayerSeat,
   type RoundResult,
@@ -38,6 +40,15 @@ const SEATS: PlayerSeat[] = [
   { id: "karan", name: "Karan" },
   { id: "neeraj", name: "Neeraj" },
 ];
+
+const SS_RULES: Rules = { ...RULES, sideshowEnabled: true };
+
+// Everyone sees in lap 1; returns state with Rahul to act in lap 2, all 4 active & seen.
+function allSeenLap2() {
+  let s = startRound(SEATS, SS_RULES);
+  for (let i = 0; i < 4; i++) s = applyPlay(s, SS_RULES, "SEEN");
+  return s;
+}
 
 function play(seats: PlayerSeat[], rules: Rules, moves: ["BLIND" | "SEEN" | "FOLD" | "SHOW"][]) {
   let s = startRound(seats, rules);
@@ -265,4 +276,84 @@ test("setWinners rejects non-active, empty, and duplicate winners", () => {
   s = applyPlay(s, RULES, "FOLD"); // rahul sole survivor
   assert.throws(() => setWinners(s, []), /At least one/);
   assert.throws(() => setWinners(s, ["amit"]), /not an active/);
+});
+
+test("side-show: offered only to a seen player vs a seen previous player, >2 active", () => {
+  const s = allSeenLap2();
+  assert.equal(currentPlayer(s)!.id, "rahul");
+  assert.equal(sideShowTarget(s), "neeraj"); // previous active, seen
+  assert.deepEqual(availableActions(s, SS_RULES), ["SEEN", "SIDE_SHOW", "FOLD"]);
+  // disabled by rules
+  assert.equal(canSideShow(s, { ...SS_RULES, sideshowEnabled: false }), false);
+});
+
+test("side-show not offered when the previous active player is blind", () => {
+  let s = startRound(SEATS, SS_RULES);
+  s = applyPlay(s, SS_RULES, "SEEN"); // rahul seen
+  s = applyPlay(s, SS_RULES, "BLIND"); // amit blind
+  s = applyPlay(s, SS_RULES, "SEEN"); // karan seen -> neeraj
+  s = applyPlay(s, SS_RULES, "SEEN"); // neeraj -> rahul (lap2)
+  s = applyPlay(s, SS_RULES, "SEEN"); // rahul -> amit
+  s = applyPlay(s, SS_RULES, "BLIND"); // amit stays blind -> karan
+  // karan is seen but his previous active (amit) is blind
+  assert.equal(currentPlayer(s)!.id, "karan");
+  assert.equal(sideShowTarget(s), null);
+  assert.equal(availableActions(s, SS_RULES).includes("SIDE_SHOW"), false);
+});
+
+test("side-show TARGET_FOLDS: cost paid, target out, requester continues", () => {
+  let s = allSeenLap2();
+  const potBefore = s.pot; // 40000 boots + 80000 seen = 120000
+  s = applyPlay(s, SS_RULES, "SIDE_SHOW", { outcome: "TARGET_FOLDS" });
+  assert.equal(s.pot, potBefore + 20000);
+  assert.equal(s.players.find((p) => p.id === "rahul")!.contribution, 50000); // boot+seen+sideshow
+  assert.equal(s.players.find((p) => p.id === "neeraj")!.status, "FOLDED");
+  assert.equal(currentPlayer(s)!.id, "amit"); // play continues after requester
+  assert.equal(activePlayers(s).length, 3);
+});
+
+test("side-show REQUESTER_FOLDS and DECLINE outcomes", () => {
+  let req = applyPlay(allSeenLap2(), SS_RULES, "SIDE_SHOW", { outcome: "REQUESTER_FOLDS" });
+  assert.equal(req.players.find((p) => p.id === "rahul")!.status, "FOLDED");
+  assert.equal(req.players.find((p) => p.id === "neeraj")!.status, "ACTIVE");
+  assert.equal(currentPlayer(req)!.id, "amit");
+
+  let dec = applyPlay(allSeenLap2(), SS_RULES, "SIDE_SHOW", { outcome: "DECLINE" });
+  assert.equal(activePlayers(dec).length, 4); // nobody folds
+  assert.equal(dec.players.find((p) => p.id === "rahul")!.contribution, 50000); // still paid
+  assert.equal(currentPlayer(dec)!.id, "amit");
+});
+
+test("side-show requires an outcome and respects eligibility", () => {
+  const s = allSeenLap2();
+  assert.throws(() => applyPlay(s, SS_RULES, "SIDE_SHOW"), /requires an outcome/);
+  // with only 2 active it's a show, not a side-show
+  let two = startRound(SEATS, SS_RULES);
+  two = applyPlay(two, SS_RULES, "SEEN"); // rahul
+  two = applyPlay(two, SS_RULES, "SEEN"); // amit
+  two = applyPlay(two, SS_RULES, "FOLD"); // karan
+  two = applyPlay(two, SS_RULES, "FOLD"); // neeraj -> rahul, 2 active
+  assert.throws(() => applyPlay(two, SS_RULES, "SIDE_SHOW", { outcome: "DECLINE" }), /not allowed/);
+});
+
+test("side-show: undo restores the folded target, pot and contribution", () => {
+  const before = allSeenLap2();
+  const after = applyPlay(before, SS_RULES, "SIDE_SHOW", { outcome: "TARGET_FOLDS" });
+  const back = undo(SEATS, SS_RULES, after);
+  assert.equal(back.pot, before.pot);
+  assert.equal(back.players.find((p) => p.id === "neeraj")!.status, "ACTIVE");
+  assert.equal(back.players.find((p) => p.id === "rahul")!.contribution, 30000);
+  assert.equal(currentPlayer(back)!.id, "rahul");
+});
+
+test("side-show: replay reproduces the outcome and stays zero-sum", () => {
+  let s = allSeenLap2();
+  s = applyPlay(s, SS_RULES, "SIDE_SHOW", { outcome: "TARGET_FOLDS" }); // neeraj out
+  s = applyPlay(s, SS_RULES, "FOLD"); // amit
+  s = applyPlay(s, SS_RULES, "FOLD"); // karan -> rahul sole survivor
+  const replayed = buildState(SEATS, SS_RULES, playLog(s));
+  assert.equal(replayed.players.find((p) => p.id === "neeraj")!.status, "FOLDED");
+  assert.equal(replayed.pot, s.pot);
+  const done = setWinners(replayed, ["rahul"]);
+  assertZeroSum(netBalances(SEATS.map((x) => x.id), [finalizeRound(done)]));
 });
